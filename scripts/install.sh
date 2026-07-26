@@ -197,7 +197,9 @@ enable_spi() {
 
 # Check if device is Pi Zero/Zero 2 W and offer WiFi stability fixes
 setup_wifi_stability() {
-    MODEL=$(cat /proc/device-tree/model 2>/dev/null)
+    # tr strips the trailing NUL of the device-tree string — bash 5.2+
+    # warns "ignored null byte in input" on the bare cat.
+    MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
     if [[ ! "$MODEL" == *"Zero 2 W"* ]] && [[ ! "$MODEL" == *"Zero W"* ]]; then
         return 0
     fi
@@ -557,8 +559,12 @@ main() {
     enable_spi
     enable_ntp
     setup_journald
-    setup_wifi_stability
+    # clone MUST precede setup_wifi_stability: since #245 M5 D8 the watchdog
+    # and reset-wifi helpers install FROM the cloned repo ($INSTALL_DIR/
+    # scripts/…), so running the WiFi block pre-clone aborts every fresh
+    # DIY install on Zero-family boards (trixie Zero W hardware QA 2026-07).
     clone_repository
+    setup_wifi_stability
     setup_unprivileged_ports
     download_quote_images
     setup_python_env
