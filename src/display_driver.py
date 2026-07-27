@@ -167,6 +167,23 @@ def display_geometry() -> tuple[int, int]:
         return DEFAULT_GEOMETRY
 
 
+def _spi_diagnosis() -> str:
+    """Explain an SPI open failure in terms the operator can act on."""
+    import glob  # noqa: PLC0415
+
+    nodes = glob.glob("/dev/spidev*")
+    if not nodes:
+        return (
+            "no /dev/spidev* device: SPI is not enabled. Add 'dtparam=spi=on' to "
+            "/boot/firmware/config.txt (or /boot/config.txt on pre-bookworm) and reboot"
+        )
+    return (
+        f"SPI devices exist ({', '.join(sorted(nodes))}) but could not be opened: "
+        f"check that user '{os.environ.get('USER', 'pi')}' is in the 'spi' and 'gpio' groups "
+        "(usermod -aG spi,gpio <user>, then reboot)"
+    )
+
+
 def _call_with_timeout(fn, timeout_s: float, desc: str):
     """Run ``fn()`` on a daemon thread, raising TimeoutError if it doesn't
     return in ``timeout_s``. The vendor drivers poll the BUSY pin in infinite
@@ -243,7 +260,23 @@ class EinkPanel:
     # -- vendor-shaped API -------------------------------------------------
 
     def init(self):
-        ret = _call_with_timeout(self.epd.init, self._timeout_s, f"{self.model} init")
+        def _init():
+            try:
+                return self.epd.init()
+            except TypeError:
+                # Some drivers (e.g. epd2in13_V2) require an update-mode
+                # argument: init(FULL_UPDATE). FULL_UPDATE is 0 across the
+                # drivers that take it — full refresh is what the clock
+                # wants on every tick anyway.
+                return self.epd.init(0)
+
+        try:
+            ret = _call_with_timeout(_init, self._timeout_s, f"{self.model} init")
+        except (FileNotFoundError, PermissionError) as e:
+            # The vendor driver opens /dev/spidev0.0 here. Bare ENOENT/EACCES
+            # from deep inside epdconfig is unactionable ("[Errno 2] No such
+            # file or directory" with no path); say what's actually wrong.
+            raise type(e)(f"{e} — {_spi_diagnosis()}") from e
         # Vendor init() returns 0 on success and -1 on failure (or None on
         # drivers that don't report). Surface the failure instead of letting
         # a dead panel look initialized.

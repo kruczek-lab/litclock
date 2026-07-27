@@ -83,12 +83,12 @@ install_system_packages() {
         python3-pip \
         python3-venv \
         python3-dev \
-        ttf-wqy-zenhei \
-        ttf-wqy-microhei \
+        fonts-wqy-zenhei \
+        fonts-wqy-microhei \
         libopenjp2-7-dev \
         libjpeg-dev \
         zlib1g-dev \
-        libfreetype6-dev \
+        libfreetype-dev \
         liblcms2-dev \
         libwebp-dev \
         tcl8.6-dev \
@@ -96,6 +96,10 @@ install_system_packages() {
         libharfbuzz-dev \
         libfribidi-dev \
         libxcb1-dev \
+        python3-gpiozero \
+        python3-lgpio \
+        python3-spidev \
+        python3-pigpio \
         wireless-tools \
         qrencode \
         jq
@@ -174,15 +178,25 @@ setup_unprivileged_ports() {
 enable_spi() {
     log_info "Enabling SPI interface..."
 
+    # /boot/firmware/config.txt FIRST: on Raspberry Pi OS bookworm and newer
+    # the firmware partition moved there, and /boot/config.txt may still
+    # exist on the root filesystem as a stale or compatibility file that the
+    # firmware NEVER reads. Preferring /boot/config.txt (the pre-bookworm
+    # location) silently writes dtparam=spi=on somewhere with no effect —
+    # the installer reports success, /dev/spidev* never appears, and the
+    # e-ink stays blank forever. Matches pi-gen's ordering
+    # (stage3/02-configure-system/00-run.sh). Trixie Zero W hardware QA
+    # 2026-07.
     BOOT_CONFIG=""
-    if [ -f "/boot/config.txt" ]; then
-        BOOT_CONFIG="/boot/config.txt"
-    elif [ -f "/boot/firmware/config.txt" ]; then
+    if [ -f "/boot/firmware/config.txt" ]; then
         BOOT_CONFIG="/boot/firmware/config.txt"
+    elif [ -f "/boot/config.txt" ]; then
+        BOOT_CONFIG="/boot/config.txt"
     else
         log_error "Could not find boot config file"
         return 1
     fi
+    log_info "Using boot config: $BOOT_CONFIG"
 
     if grep -q "^dtparam=spi=on" "$BOOT_CONFIG"; then
         log_info "SPI is already enabled"
@@ -193,11 +207,76 @@ enable_spi() {
         echo "dtparam=spi=on" | sudo tee -a "$BOOT_CONFIG" > /dev/null
         log_info "SPI enabled (added to config)"
     fi
+
+    # The Waveshare e-Paper HAT uses SPI0 with a single chip-select (CE0).
+    # The default SPI overlay exposes two; spi0-1cs restricts to CE0, which
+    # is the configuration the display driver expects. pi-gen has always
+    # written this — the DIY path never did (parity gap).
+    if ! grep -q "^dtoverlay=spi0-1cs" "$BOOT_CONFIG"; then
+        echo "dtoverlay=spi0-1cs" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+        log_info "SPI single-chip-select overlay enabled"
+    fi
+}
+
+# Passwordless sudo for the service account + the config dir, both of which
+# the flashed image has had since day one (pi-gen stage3/02-configure-system)
+# and the DIY installer never created.
+#
+# Why it's load-bearing: litclock-firstboot.service runs first-boot.sh as
+# `User=pi` under systemd, with NO terminal. Without NOPASSWD, every sudo
+# call it makes that isn't in the narrow 020_litclock-control allowlist fails
+# instantly ("a terminal is required to read the password") — including
+# `sudo mkdir -p /etc/litclock` in mark_setup_complete. The observable result
+# is brutal: setup appears to succeed and paints "Setup Complete! Starting
+# your clock...", but .setup-complete is never written, so litclock-control
+# (ConditionPathExists) never starts, the handoff never completes,
+# litclock.service stays gated forever, and first-boot re-runs on every boot.
+# The e-ink is bistable, so the stale success splash sits there looking
+# healthy. Trixie Zero W hardware QA 2026-07.
+#
+# Scope note: this matches what the flashed image already does. The threat
+# model is unchanged — SSH ships off and shell access is physical-only.
+setup_service_account_privileges() {
+    log_info "Installing passwordless sudo for the pi service account (parity with the flashed image)..."
+    _sudoers_tmp=$(mktemp)
+    echo "pi ALL=(ALL) NOPASSWD: ALL" > "$_sudoers_tmp"
+    # Validate BEFORE installing — a malformed sudoers file locks out sudo
+    # system-wide. Same guard the 020 install below uses.
+    if ! sudo visudo -c -f "$_sudoers_tmp" > /dev/null; then
+        log_error "Generated 010_pi-nopasswd failed visudo validation; not installed"
+        rm -f "$_sudoers_tmp"
+        exit 1
+    fi
+    sudo install -m 0440 -o root -g root "$_sudoers_tmp" /etc/sudoers.d/010_pi-nopasswd
+    rm -f "$_sudoers_tmp"
+
+    # Config/marker directory read by the firstboot, control, bootcheck and
+    # reresolve units' ConditionPathExists gates.
+    sudo install -d -m 0755 /etc/litclock
+
+    log_info "Service account privileges configured"
+}
+
+# Group membership for the service account. pi-gen does this in
+# stage3/02-configure-system; the DIY installer never did, so even once
+# /dev/spidev* exists the `pi` user gets EACCES opening it and the e-ink
+# stays blank. systemd-journal is what lets the diagnostics page render
+# its journal tail (#433).
+setup_user_groups() {
+    log_info "Adding $USER to hardware access groups..."
+    for grp in gpio spi i2c systemd-journal; do
+        if getent group "$grp" > /dev/null 2>&1; then
+            sudo usermod -aG "$grp" "$USER"
+        fi
+    done
+    log_info "Group membership updated (takes effect after reboot)"
 }
 
 # Check if device is Pi Zero/Zero 2 W and offer WiFi stability fixes
 setup_wifi_stability() {
-    MODEL=$(cat /proc/device-tree/model 2>/dev/null)
+    # tr strips the trailing NUL of the device-tree string — bash 5.2+
+    # warns "ignored null byte in input" on the bare cat.
+    MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
     if [[ ! "$MODEL" == *"Zero 2 W"* ]] && [[ ! "$MODEL" == *"Zero W"* ]]; then
         return 0
     fi
@@ -555,10 +634,16 @@ main() {
     install_system_packages
     install_bcm2835
     enable_spi
+    setup_service_account_privileges
+    setup_user_groups
     enable_ntp
     setup_journald
-    setup_wifi_stability
+    # clone MUST precede setup_wifi_stability: since #245 M5 D8 the watchdog
+    # and reset-wifi helpers install FROM the cloned repo ($INSTALL_DIR/
+    # scripts/…), so running the WiFi block pre-clone aborts every fresh
+    # DIY install on Zero-family boards (trixie Zero W hardware QA 2026-07).
     clone_repository
+    setup_wifi_stability
     setup_unprivileged_ports
     download_quote_images
     setup_python_env
