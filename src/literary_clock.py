@@ -104,7 +104,10 @@ QR_SIZE = QR_MODULES * QR_BOX_SIZE  # 75px — fixed for scannability, NOT scale
 # below so they can never drift apart. PIL paints a width=4 horizontal line
 # at y=78 (800×480 reference) across rows 77..80 (centerline convention).
 DIVIDER_Y = _sy(78)
-DIVIDER_WIDTH = 4
+# 4px is ~0.8% of the reference panel's height; kept literal there so the
+# locked geometry is untouched, scaled elsewhere so a small panel doesn't get
+# a rule that reads as a heavy black bar (2.7" hardware QA).
+DIVIDER_WIDTH = 4 if DISPLAY_SIZE == _REF_SIZE else max(2, round(4 * _SCALE_MIN))
 # Corner-QR anchor, derived from the panel width. At 800×480 this is the
 # locked (713, 0) geometry (800 − 75 − 12; validated on-phone in M0).
 QR_POSITION = (DISPLAY_SIZE[0] - QR_SIZE - 4 * QR_BOX_SIZE, 0)
@@ -195,9 +198,9 @@ def main():
 
         icon_path = os.path.join(PROJECT_ROOT, "icons", f"{icon}.xbm")
         try:
-            icon_px = _sf(64, 16)
-            icon_image = ImageOps.invert(Image.open(icon_path).resize((icon_px, icon_px)).convert("L"))
-            image.paste(icon_image, (_sx(20), _sy(5)))
+            icon_x, icon_y, icon_edge = _weather_icon_box()
+            icon_image = ImageOps.invert(Image.open(icon_path).resize((icon_edge, icon_edge)).convert("L"))
+            image.paste(icon_image, (icon_x, icon_y))
             logging.info(f"Icon image pasted from {icon_path}")
         except FileNotFoundError as e:
             logging.error(f"Icon file not found: {e}")
@@ -219,6 +222,11 @@ def main():
         logging.info(f"Quote rendered for {quote_meta['image_path']}")
 
     temps = f"{temp_high} / {temp_low}" if weather is not None else None
+    # Narrow-panel variant: one unit marker instead of two, no spaces around
+    # the slash. Same information, ~40% less width, so the date keeps its size.
+    temps_compact = (
+        f"{round(weather['temperatureMax'])}/{round(weather['temperatureMin'])}{degrees}" if weather else None
+    )
     if DISPLAY_SIZE == _REF_SIZE:
         # Reference panel: the locked 800×480 geometry, untouched.
         date_font = ImageFont.truetype(FONT_PATH, 48)
@@ -229,7 +237,7 @@ def main():
         if temps is not None:
             draw.line([(225, 0), (225, DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
     else:
-        _draw_top_strip(draw, now, temps)
+        _draw_top_strip(draw, now, temps, temps_compact)
 
     _stamp_update_failed_glyph(image, draw)
     _composite_settings_qr(image)
@@ -255,44 +263,97 @@ QUOTE_TOP = _sy(80)
 FONT_PATH_BOLD = os.path.join(PROJECT_ROOT, "fonts", "Literata72pt-Black.ttf")
 
 
-def _draw_top_strip(draw, now, temps: str | None) -> None:
+# Top-strip typography for non-reference panels. The temperatures are sized
+# RELATIVE to the date rather than independently: sizing them on their own
+# bottomed out at the _sf() floor, leaving 10px temps beside an 18px date —
+# inconsistent, and small enough that "°F" broke up (2.7" hardware QA).
+TOP_STRIP_TEMP_RATIO = 0.78
+TOP_STRIP_TEMP_MIN = 11
+TOP_STRIP_DATE_MIN = 9
+
+
+def _weather_icon_box() -> tuple[int, int, int]:
+    """``(x, y, edge)`` for the weather icon. Bounded by the strip height so
+    it can't crowd the rule on a short strip, and vertically centered."""
+    if DISPLAY_SIZE == _REF_SIZE:
+        return 20, 5, 64
+    edge = max(12, min(_sf(64, 16), DIVIDER_Y - 6))
+    return max(2, _sx(20)), max(1, (DIVIDER_Y - edge) // 2), edge
+
+
+def _draw_top_strip(draw, now, temps: str | None, temps_compact: str | None = None) -> None:
     """Top strip (weather + date + rules) for non-reference panels.
 
     The reference layout hard-codes x=100 for the temperatures and x=225 for
-    the vertical rule. Scaled to a 2.7" panel those land on top of each other
-    — the temps overprint the rule (visible on hardware). Here the block is
-    measured instead: the rule goes wherever the weather text actually ends,
-    and the date takes the remaining width, shrinking until it fits.
+    the vertical rule; scaled down those collide (the temps overprint the
+    rule — visible on hardware). This measures instead, and fits the date and
+    temperatures TOGETHER: the largest date size whose companion temperature
+    text still leaves room wins, so the two always look like one typographic
+    system. Falls back to a compact temperature form, then to dropping the
+    temperatures, then to a short date — a panel too narrow for everything
+    sheds detail in that order rather than overprinting.
     """
-    icon_right = _sx(20) + _sf(64, 16)  # weather icon occupies the left edge
-    cursor = icon_right + max(2, _sx(10))
-
-    if temps is not None:
-        temp_font = ImageFont.truetype(FONT_PATH, _sf(24))
-        temp_w = draw.textlength(temps, font=temp_font)
-        temp_y = max(0, (DIVIDER_Y - _sf(24)) // 2)
-        draw.text((cursor, temp_y), temps, font=temp_font, fill=0)
-        rule_x = int(cursor + temp_w + max(3, _sx(12)))
-        draw.line([(rule_x, 0), (rule_x, DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
-        date_x = rule_x + max(3, _sx(12))
-    else:
-        date_x = cursor
-
-    # Largest date face that still fits the remaining strip width.
-    available = DISPLAY_SIZE[0] - date_x - max(2, _sx(8))
+    # Ink must clear the horizontal rule, which PIL centers on DIVIDER_Y.
+    glyph_h = max(8, DIVIDER_Y - DIVIDER_WIDTH // 2 - 3)
+    edge_pad = max(3, round(DISPLAY_SIZE[0] * 0.025))
+    rule_gap = max(5, round(DISPLAY_SIZE[0] * 0.045))
     date_text = now.strftime("%a, %B %d")
-    date_font = None
-    for size in range(_sf(48, 12), 7, -1):
-        candidate = ImageFont.truetype(FONT_PATH, size)
-        if draw.textlength(date_text, font=candidate) <= available:
-            date_font = candidate
-            break
-    if date_font is None:
-        date_font = ImageFont.truetype(FONT_PATH, 8)
-        date_text = now.strftime("%b %d")
-    date_y = max(0, (DIVIDER_Y - date_font.size) // 2)
-    draw.text((date_x, date_y), date_text, font=date_font, fill=0)
+    date_max = min(_sf(48, 12), glyph_h)
 
+    icon_x, _icon_y, icon_edge = _weather_icon_box()
+    temps_start = icon_x + icon_edge + edge_pad
+
+    def _measure(text, font):
+        box = draw.textbbox((0, 0), text, font=font)
+        return box, box[2] - box[0], box[3] - box[1]
+
+    # Candidate temperature strings, most informative first.
+    variants = [v for v in (temps, temps_compact) if v] or [None]
+    if temps is not None:
+        variants.append(None)  # last resort: date only
+
+    chosen = None
+    for temp_text in variants:
+        for date_size in range(date_max, TOP_STRIP_DATE_MIN - 1, -1):
+            date_font = ImageFont.truetype(FONT_PATH, date_size)
+            date_box, date_w, date_h = _measure(date_text, date_font)
+            if date_h > glyph_h:
+                continue
+            if temp_text is None:
+                if edge_pad + date_w <= DISPLAY_SIZE[0] - edge_pad:
+                    chosen = (date_font, date_box, edge_pad, None, None, None)
+                    break
+                continue
+            temp_size = max(TOP_STRIP_TEMP_MIN, int(date_size * TOP_STRIP_TEMP_RATIO))
+            temp_font = ImageFont.truetype(FONT_PATH, temp_size)
+            temp_box, temp_w, temp_h = _measure(temp_text, temp_font)
+            if temp_h > glyph_h:
+                continue
+            rule_x = temps_start + temp_w + rule_gap
+            date_x = rule_x + rule_gap
+            if date_x + date_w <= DISPLAY_SIZE[0] - edge_pad:
+                chosen = (date_font, date_box, date_x, temp_font, temp_box, (temp_text, rule_x))
+                break
+        if chosen:
+            break
+
+    if chosen is None:  # pathological narrowness — shortest date, nothing else
+        date_text = now.strftime("%b %d")
+        date_font = ImageFont.truetype(FONT_PATH, TOP_STRIP_DATE_MIN)
+        chosen = (date_font, _measure(date_text, date_font)[0], edge_pad, None, None, None)
+
+    date_font, date_box, date_x, temp_font, temp_box, rule = chosen
+
+    def _centered_y(box):
+        """Draw-y that centers the glyph INK (not the em box) in the strip."""
+        return (glyph_h - (box[3] - box[1])) // 2 - box[1]
+
+    if rule is not None:
+        temp_text, rule_x = rule
+        draw.text((temps_start, _centered_y(temp_box)), temp_text, font=temp_font, fill=0)
+        draw.line([(rule_x, 0), (rule_x, DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
+
+    draw.text((date_x, _centered_y(date_box)), date_text, font=date_font, fill=0)
     draw.line([(0, DIVIDER_Y), (DISPLAY_SIZE[0], DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
 
 

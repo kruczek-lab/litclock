@@ -297,3 +297,89 @@ class TestRendererGeometryIntegration:
             # Locked 7.5" geometry restored (matches test_literary_clock.py).
             assert mod.QR_CORNER_FITS is True
             assert mod.QR_POSITION == (713, 0)
+
+
+@pytest.mark.skipif(not _HAS_PIL, reason="PIL required")
+class TestTopStripLayout:
+    """Small-panel top strip (literary_clock._draw_top_strip). Locks the
+    defects found on 2.7" hardware: temps pinned at the size floor beside a
+    much larger date, and the date crowding the vertical rule."""
+
+    @staticmethod
+    def _clock(width: str, height: str):
+        import importlib
+
+        os.environ["EINK_WIDTH"], os.environ["EINK_HEIGHT"] = width, height
+        return importlib.reload(importlib.import_module("literary_clock"))
+
+    @staticmethod
+    def _restore():
+        import importlib
+
+        os.environ.pop("EINK_WIDTH", None)
+        os.environ.pop("EINK_HEIGHT", None)
+        importlib.reload(importlib.import_module("literary_clock"))
+
+    def _strip(self, lc, temps="95°F / 73°F", compact="95/73°F"):
+        from datetime import datetime
+
+        from PIL import Image, ImageDraw
+
+        img = Image.new("1", lc.DISPLAY_SIZE, 255)
+        lc._draw_top_strip(ImageDraw.Draw(img), datetime(2026, 7, 26, 20, 36), temps, compact)
+        return img
+
+    def test_ink_never_crosses_the_horizontal_rule_or_edges(self):
+        try:
+            for w, h in (("264", "176"), ("250", "122"), ("400", "300")):
+                lc = self._clock(w, h)
+                bbox = self._strip(lc).point(lambda p: 255 - p).getbbox()
+                assert bbox is not None
+                assert bbox[2] <= lc.DISPLAY_SIZE[0], f"{w}x{h}: ink past right edge"
+                assert bbox[3] <= lc.DIVIDER_Y + lc.DIVIDER_WIDTH, f"{w}x{h}: ink below the rule"
+        finally:
+            self._restore()
+
+    def test_temperatures_are_not_pinned_at_the_size_floor(self):
+        """Regression: sizing temps independently bottomed out at 10px next
+        to an 18px date, which shredded the degree glyphs on hardware."""
+        try:
+            lc = self._clock("264", "176")
+            assert lc.TOP_STRIP_TEMP_MIN >= 11
+            # Temps ride off the date size, so they track it rather than floor.
+            assert lc.TOP_STRIP_TEMP_RATIO >= 0.7
+        finally:
+            self._restore()
+
+    def test_date_has_breathing_room_after_the_rule(self):
+        """The date must not butt against the vertical rule (reported from
+        hardware). Assert a real gap of blank columns between them."""
+        try:
+            lc = self._clock("264", "176")
+            img = self._strip(lc)
+            px = img.load()
+            band = range(0, max(1, lc.DIVIDER_Y - 2))
+            inked = [x for x in range(lc.DISPLAY_SIZE[0]) if any(px[x, y] == 0 for y in band)]
+            # The vertical rule is a fully-inked column; find it, then require
+            # clear columns before the date's first ink.
+            rule_x = max(x for x in inked if all(px[x, y] == 0 for y in band))
+            after = [x for x in inked if x > rule_x + lc.DIVIDER_WIDTH]
+            assert after, "no date ink right of the rule"
+            assert after[0] - rule_x >= 5, f"date only {after[0] - rule_x}px from the rule"
+        finally:
+            self._restore()
+
+    def test_falls_back_to_date_only_when_impossibly_narrow(self):
+        try:
+            lc = self._clock("120", "80")
+            bbox = self._strip(lc).point(lambda p: 255 - p).getbbox()
+            assert bbox is not None and bbox[2] <= 120
+        finally:
+            self._restore()
+
+    def test_reference_panel_keeps_the_locked_rule_weight(self):
+        import importlib
+
+        lc = importlib.reload(importlib.import_module("literary_clock"))
+        assert lc.DISPLAY_SIZE == (800, 480)
+        assert lc.DIVIDER_WIDTH == 4
