@@ -178,15 +178,25 @@ setup_unprivileged_ports() {
 enable_spi() {
     log_info "Enabling SPI interface..."
 
+    # /boot/firmware/config.txt FIRST: on Raspberry Pi OS bookworm and newer
+    # the firmware partition moved there, and /boot/config.txt may still
+    # exist on the root filesystem as a stale or compatibility file that the
+    # firmware NEVER reads. Preferring /boot/config.txt (the pre-bookworm
+    # location) silently writes dtparam=spi=on somewhere with no effect —
+    # the installer reports success, /dev/spidev* never appears, and the
+    # e-ink stays blank forever. Matches pi-gen's ordering
+    # (stage3/02-configure-system/00-run.sh). Trixie Zero W hardware QA
+    # 2026-07.
     BOOT_CONFIG=""
-    if [ -f "/boot/config.txt" ]; then
-        BOOT_CONFIG="/boot/config.txt"
-    elif [ -f "/boot/firmware/config.txt" ]; then
+    if [ -f "/boot/firmware/config.txt" ]; then
         BOOT_CONFIG="/boot/firmware/config.txt"
+    elif [ -f "/boot/config.txt" ]; then
+        BOOT_CONFIG="/boot/config.txt"
     else
         log_error "Could not find boot config file"
         return 1
     fi
+    log_info "Using boot config: $BOOT_CONFIG"
 
     if grep -q "^dtparam=spi=on" "$BOOT_CONFIG"; then
         log_info "SPI is already enabled"
@@ -197,6 +207,30 @@ enable_spi() {
         echo "dtparam=spi=on" | sudo tee -a "$BOOT_CONFIG" > /dev/null
         log_info "SPI enabled (added to config)"
     fi
+
+    # The Waveshare e-Paper HAT uses SPI0 with a single chip-select (CE0).
+    # The default SPI overlay exposes two; spi0-1cs restricts to CE0, which
+    # is the configuration the display driver expects. pi-gen has always
+    # written this — the DIY path never did (parity gap).
+    if ! grep -q "^dtoverlay=spi0-1cs" "$BOOT_CONFIG"; then
+        echo "dtoverlay=spi0-1cs" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+        log_info "SPI single-chip-select overlay enabled"
+    fi
+}
+
+# Group membership for the service account. pi-gen does this in
+# stage3/02-configure-system; the DIY installer never did, so even once
+# /dev/spidev* exists the `pi` user gets EACCES opening it and the e-ink
+# stays blank. systemd-journal is what lets the diagnostics page render
+# its journal tail (#433).
+setup_user_groups() {
+    log_info "Adding $USER to hardware access groups..."
+    for grp in gpio spi i2c systemd-journal; do
+        if getent group "$grp" > /dev/null 2>&1; then
+            sudo usermod -aG "$grp" "$USER"
+        fi
+    done
+    log_info "Group membership updated (takes effect after reboot)"
 }
 
 # Check if device is Pi Zero/Zero 2 W and offer WiFi stability fixes
@@ -561,6 +595,7 @@ main() {
     install_system_packages
     install_bcm2835
     enable_spi
+    setup_user_groups
     enable_ntp
     setup_journald
     # clone MUST precede setup_wifi_stability: since #245 M5 D8 the watchdog
