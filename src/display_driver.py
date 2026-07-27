@@ -260,8 +260,18 @@ class EinkPanel:
     # -- vendor-shaped API -------------------------------------------------
 
     def init(self):
+        def _init():
+            try:
+                return self.epd.init()
+            except TypeError:
+                # Some drivers (e.g. epd2in13_V2) require an update-mode
+                # argument: init(FULL_UPDATE). FULL_UPDATE is 0 across the
+                # drivers that take it — full refresh is what the clock
+                # wants on every tick anyway.
+                return self.epd.init(0)
+
         try:
-            ret = _call_with_timeout(self.epd.init, self._timeout_s, f"{self.model} init")
+            ret = _call_with_timeout(_init, self._timeout_s, f"{self.model} init")
         except (FileNotFoundError, PermissionError) as e:
             # The vendor driver opens /dev/spidev0.0 here. Bare ENOENT/EACCES
             # from deep inside epdconfig is unactionable ("[Errno 2] No such

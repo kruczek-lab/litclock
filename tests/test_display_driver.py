@@ -36,7 +36,15 @@ except ImportError:
     _HAS_PIL = False
 
 
-def _make_epd_class(width: int, height: int, *, init_ret=0, clear_needs_arg=False, init_hang_s: float = 0):
+def _make_epd_class(
+    width: int,
+    height: int,
+    *,
+    init_ret=0,
+    clear_needs_arg=False,
+    init_needs_arg=False,
+    init_hang_s: float = 0,
+):
     class FakeEPD:
         instances: list = []
 
@@ -47,11 +55,20 @@ def _make_epd_class(width: int, height: int, *, init_ret=0, clear_needs_arg=Fals
             self.buffers: list = []
             FakeEPD.instances.append(self)
 
-        def init(self):
-            if init_hang_s:
-                time.sleep(init_hang_s)
-            self.calls.append("init")
-            return init_ret
+        if init_needs_arg:
+
+            def init(self, update):
+                if init_hang_s:
+                    time.sleep(init_hang_s)
+                self.calls.append(("init", update))
+                return init_ret
+        else:
+
+            def init(self):
+                if init_hang_s:
+                    time.sleep(init_hang_s)
+                self.calls.append("init")
+                return init_ret
 
         def getbuffer(self, image):
             self.calls.append("getbuffer")
@@ -194,6 +211,15 @@ class TestEinkPanel:
         panel = display_driver.get_panel()
         panel.Clear()
         assert ("clear", 0xFF) in panel.epd.calls
+
+    def test_init_signature_fallback(self, monkeypatch, fake_driver):
+        """epd2in13_V2-style drivers require init(update); the adapter must
+        retry with FULL_UPDATE (0) rather than dying on the TypeError."""
+        fake_driver("epd_arginit", 250, 122, init_needs_arg=True)
+        monkeypatch.setenv("EINK_MODEL", "epd_arginit")
+        panel = display_driver.get_panel()
+        assert panel.init() == 0
+        assert ("init", 0) in panel.epd.calls
 
     def test_init_failure_raises(self, monkeypatch, fake_driver):
         fake_driver("epd_dead", 250, 122, init_ret=-1)
