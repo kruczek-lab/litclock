@@ -15,6 +15,7 @@ from random import randrange
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 import quote_corpus
+import quote_renderer
 from control_url import control_base_url  # QR target — single source of truth (#343)
 from log import setup_logging
 
@@ -214,20 +215,21 @@ def main():
         draw.text((_sx(220), _sy(150)), now.strftime("%H:%M"), font=time_font, fill=0)
         logging.info("Time drawn on image")
     else:
-        quote_image = Image.open(quote_meta["image_path"]).convert("1")
-        _paste_quote_image(image, quote_image)
-        logging.info(f"Quote image pasted from {quote_meta['image_path']}")
+        _render_quote_area(image, quote_meta)
+        logging.info(f"Quote rendered for {quote_meta['image_path']}")
 
-    date_font = ImageFont.truetype(FONT_PATH, _sf(48, 12))
-    draw.text((_sx(250), _sy(10)), now.strftime("%a, %B %d"), font=date_font, fill=0)
-
-    if weather is not None:
-        temp_font = ImageFont.truetype(FONT_PATH, _sf(24))
-        draw.text((_sx(100), _sy(20)), f"{temp_high} / {temp_low}", font=temp_font, fill=0)
-
-    draw.line([(0, DIVIDER_Y), (DISPLAY_SIZE[0], DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
-    if weather is not None:
-        draw.line([(_sx(225), 0), (_sx(225), DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
+    temps = f"{temp_high} / {temp_low}" if weather is not None else None
+    if DISPLAY_SIZE == _REF_SIZE:
+        # Reference panel: the locked 800×480 geometry, untouched.
+        date_font = ImageFont.truetype(FONT_PATH, 48)
+        draw.text((250, 10), now.strftime("%a, %B %d"), font=date_font, fill=0)
+        if temps is not None:
+            draw.text((100, 20), temps, font=ImageFont.truetype(FONT_PATH, 24), fill=0)
+        draw.line([(0, DIVIDER_Y), (DISPLAY_SIZE[0], DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
+        if temps is not None:
+            draw.line([(225, 0), (225, DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
+    else:
+        _draw_top_strip(draw, now, temps)
 
     _stamp_update_failed_glyph(image, draw)
     _composite_settings_qr(image)
@@ -239,20 +241,69 @@ def main():
 
 
 # The corpus PNGs are pre-rendered for the 800×480 reference layout (800×400,
-# pasted under the 80px top strip). On the reference panel the paste is
-# byte-exact, untouched. Any other panel scale-to-fits the pre-rendered art:
-# grayscale LANCZOS resample, then re-threshold to 1-bit (resizing a mode-"1"
-# image directly produces unreadable speckle). Legibility of very long quotes
-# degrades on small panels — a per-resolution corpus is the real fix (tracked
-# as follow-up); this keeps every panel functional today.
+# pasted under the 80px top strip), so on the reference panel the paste is
+# byte-exact and untouched — that art IS the product's typography.
+#
+# Other panels render the quote natively instead (src/quote_renderer.py).
+# Downscaling the pre-rendered art was tried first and is not viable: at a
+# 2.7" panel's ~33% the body text's thin strokes fall under a pixel and the
+# 1-bit threshold shreds them, leaving only the bold time-phrase legible
+# (hardware QA 2026-07). Drawing text at the panel's own size keeps it crisp.
+# Scaling survives only as the fallback for when the corpus lookup can't
+# supply the quote text (out-of-sync corpus).
 QUOTE_TOP = _sy(80)
+FONT_PATH_BOLD = os.path.join(PROJECT_ROOT, "fonts", "Literata72pt-Black.ttf")
 
 
-def _paste_quote_image(image: Image.Image, quote_image: Image.Image) -> None:
+def _draw_top_strip(draw, now, temps: str | None) -> None:
+    """Top strip (weather + date + rules) for non-reference panels.
+
+    The reference layout hard-codes x=100 for the temperatures and x=225 for
+    the vertical rule. Scaled to a 2.7" panel those land on top of each other
+    — the temps overprint the rule (visible on hardware). Here the block is
+    measured instead: the rule goes wherever the weather text actually ends,
+    and the date takes the remaining width, shrinking until it fits.
+    """
+    icon_right = _sx(20) + _sf(64, 16)  # weather icon occupies the left edge
+    cursor = icon_right + max(2, _sx(10))
+
+    if temps is not None:
+        temp_font = ImageFont.truetype(FONT_PATH, _sf(24))
+        temp_w = draw.textlength(temps, font=temp_font)
+        temp_y = max(0, (DIVIDER_Y - _sf(24)) // 2)
+        draw.text((cursor, temp_y), temps, font=temp_font, fill=0)
+        rule_x = int(cursor + temp_w + max(3, _sx(12)))
+        draw.line([(rule_x, 0), (rule_x, DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
+        date_x = rule_x + max(3, _sx(12))
+    else:
+        date_x = cursor
+
+    # Largest date face that still fits the remaining strip width.
+    available = DISPLAY_SIZE[0] - date_x - max(2, _sx(8))
+    date_text = now.strftime("%a, %B %d")
+    date_font = None
+    for size in range(_sf(48, 12), 7, -1):
+        candidate = ImageFont.truetype(FONT_PATH, size)
+        if draw.textlength(date_text, font=candidate) <= available:
+            date_font = candidate
+            break
+    if date_font is None:
+        date_font = ImageFont.truetype(FONT_PATH, 8)
+        date_text = now.strftime("%b %d")
+    date_y = max(0, (DIVIDER_Y - date_font.size) // 2)
+    draw.text((date_x, date_y), date_text, font=date_font, fill=0)
+
+    draw.line([(0, DIVIDER_Y), (DISPLAY_SIZE[0], DIVIDER_Y)], fill=0, width=DIVIDER_WIDTH)
+
+
+def _scale_quote_image(image: Image.Image, quote_image: Image.Image) -> None:
+    """Last-resort path: fit the pre-rendered art to the panel. Grayscale
+    LANCZOS then re-threshold — resizing a mode-"1" image directly produces
+    pure speckle."""
     target_w = DISPLAY_SIZE[0]
     target_h = DISPLAY_SIZE[1] - QUOTE_TOP
     qw, qh = quote_image.size
-    if (target_w, target_h) == (qw, qh) or DISPLAY_SIZE == _REF_SIZE:
+    if (target_w, target_h) == (qw, qh):
         image.paste(quote_image, (0, QUOTE_TOP))
         return
     factor = min(target_w / qw, target_h / qh)
@@ -261,6 +312,42 @@ def _paste_quote_image(image: Image.Image, quote_image: Image.Image) -> None:
     scaled = quote_image.convert("L").resize((new_w, new_h), Image.Resampling.LANCZOS)
     scaled = scaled.point(lambda p: 255 if p > 128 else 0).convert("1")
     image.paste(scaled, ((target_w - new_w) // 2, QUOTE_TOP))
+
+
+def _render_quote_area(image: Image.Image, quote_meta: dict) -> None:
+    """Paint the quote below the top strip.
+
+    Reference panel → paste the pre-rendered corpus PNG unchanged. Any other
+    size → render the text natively at that size. Falls back to scaling the
+    PNG if the corpus text isn't available.
+    """
+    quote_image = None
+    try:
+        quote_image = Image.open(quote_meta["image_path"]).convert("1")
+    except (OSError, KeyError) as e:
+        logging.warning(f"quote image unavailable ({e})")
+
+    if DISPLAY_SIZE == _REF_SIZE:
+        if quote_image is not None:
+            image.paste(quote_image, (0, QUOTE_TOP))
+        return
+
+    if quote_meta.get("quote"):
+        rendered = quote_renderer.render_quote(
+            (DISPLAY_SIZE[0], DISPLAY_SIZE[1] - QUOTE_TOP),
+            quote_meta["quote"],
+            quote_meta.get("timestring", ""),
+            quote_meta.get("title", ""),
+            quote_meta.get("author", ""),
+            FONT_PATH,
+            FONT_PATH_BOLD,
+        )
+        image.paste(rendered, (0, QUOTE_TOP))
+        return
+
+    if quote_image is not None:
+        logging.warning("corpus text missing for this quote — falling back to scaled art")
+        _scale_quote_image(image, quote_image)
 
 
 def get_current_quote(
@@ -294,6 +381,10 @@ def get_current_quote(
         "quote": meta.get("quote", ""),
         "author": meta.get("author", ""),
         "title": meta.get("title", ""),
+        # The phrase the corpus marks as the time reference — bolded by the
+        # PHP generator in the pre-rendered art, and by quote_renderer when
+        # drawing natively on a non-reference panel.
+        "timestring": meta.get("timestring", ""),
         "time": meta.get("time", now.strftime("%H:%M")),
         "image_path": chosen,
         "picked_at": _time.time(),
