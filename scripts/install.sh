@@ -96,6 +96,10 @@ install_system_packages() {
         libharfbuzz-dev \
         libfribidi-dev \
         libxcb1-dev \
+        python3-gpiozero \
+        python3-lgpio \
+        python3-spidev \
+        python3-pigpio \
         wireless-tools \
         qrencode \
         jq
