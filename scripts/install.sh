@@ -218,6 +218,45 @@ enable_spi() {
     fi
 }
 
+# Passwordless sudo for the service account + the config dir, both of which
+# the flashed image has had since day one (pi-gen stage3/02-configure-system)
+# and the DIY installer never created.
+#
+# Why it's load-bearing: litclock-firstboot.service runs first-boot.sh as
+# `User=pi` under systemd, with NO terminal. Without NOPASSWD, every sudo
+# call it makes that isn't in the narrow 020_litclock-control allowlist fails
+# instantly ("a terminal is required to read the password") — including
+# `sudo mkdir -p /etc/litclock` in mark_setup_complete. The observable result
+# is brutal: setup appears to succeed and paints "Setup Complete! Starting
+# your clock...", but .setup-complete is never written, so litclock-control
+# (ConditionPathExists) never starts, the handoff never completes,
+# litclock.service stays gated forever, and first-boot re-runs on every boot.
+# The e-ink is bistable, so the stale success splash sits there looking
+# healthy. Trixie Zero W hardware QA 2026-07.
+#
+# Scope note: this matches what the flashed image already does. The threat
+# model is unchanged — SSH ships off and shell access is physical-only.
+setup_service_account_privileges() {
+    log_info "Installing passwordless sudo for the pi service account (parity with the flashed image)..."
+    _sudoers_tmp=$(mktemp)
+    echo "pi ALL=(ALL) NOPASSWD: ALL" > "$_sudoers_tmp"
+    # Validate BEFORE installing — a malformed sudoers file locks out sudo
+    # system-wide. Same guard the 020 install below uses.
+    if ! sudo visudo -c -f "$_sudoers_tmp" > /dev/null; then
+        log_error "Generated 010_pi-nopasswd failed visudo validation; not installed"
+        rm -f "$_sudoers_tmp"
+        exit 1
+    fi
+    sudo install -m 0440 -o root -g root "$_sudoers_tmp" /etc/sudoers.d/010_pi-nopasswd
+    rm -f "$_sudoers_tmp"
+
+    # Config/marker directory read by the firstboot, control, bootcheck and
+    # reresolve units' ConditionPathExists gates.
+    sudo install -d -m 0755 /etc/litclock
+
+    log_info "Service account privileges configured"
+}
+
 # Group membership for the service account. pi-gen does this in
 # stage3/02-configure-system; the DIY installer never did, so even once
 # /dev/spidev* exists the `pi` user gets EACCES opening it and the e-ink
@@ -595,6 +634,7 @@ main() {
     install_system_packages
     install_bcm2835
     enable_spi
+    setup_service_account_privileges
     setup_user_groups
     enable_ntp
     setup_journald
